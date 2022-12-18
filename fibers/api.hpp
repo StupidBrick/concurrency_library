@@ -49,7 +49,7 @@ namespace Fibers {
 
         void Yield() {
             Awaiters::YieldAwaiter awaiter(Fiber::Self());
-            Suspend((Awaiters::IAwaiter*)&awaiter);
+            Suspend(&awaiter);
         }
 
         // non-blocking future wait

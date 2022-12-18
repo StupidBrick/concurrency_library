@@ -25,8 +25,6 @@ namespace Fibers {
 
         void Suspend(Awaiters::IAwaiter* awaiter);
 
-        void Resume();
-
         Executors::IExecutor& GetScheduler();
 
         bool IsValid();

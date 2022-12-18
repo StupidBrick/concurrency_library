@@ -2,13 +2,20 @@
 #include "fiber_handle.hpp"
 #include "iawaiter.hpp"
 
-
 namespace Fibers {
-
-    using Executors::IExecutor;
 
     thread_local Fiber* current_fiber = nullptr;
 
+    ////FIBER_FUNCTOR
+    void FiberFunctor::operator()() {
+        current_fiber = fiber_;
+        coroutine_->Resume();
+        if (!coroutine_->IsCompleted()) {
+            (*awaiter_)->AwaitSuspend();
+        }
+    }
+
+    //// FIBER
     Fiber::Fiber(std::function<void()> routine,
                  Executors::IExecutor& executor) : coroutine_(std::move(routine)), executor_(&executor) {
     }
@@ -23,18 +30,12 @@ namespace Fibers {
 
     void Fiber::Suspend(Awaiters::IAwaiter* awaiter) {
         awaiter_ = awaiter;
-        coroutine_.Suspend();
-    }
 
-    void Fiber::Resume() {
-        current_fiber = this;
-        coroutine_.Resume();
-        if (coroutine_.IsCompleted()) {
-            delete this;
-        }
-        else {
-            awaiter_->AwaitSuspend();
-        }
+        // because after suspend we want to reschedule this fiber,
+        // and we shouldn't delete this
+        step_.need_to_delete_after_discard_ = false;
+
+        coroutine_.Suspend();
     }
 
     Executors::IExecutor& Fiber::GetScheduler() {
@@ -45,17 +46,7 @@ namespace Fibers {
         return FiberHandle(current_fiber);
     }
 
-    void Fiber::Functor_::operator()() {
-        current_fiber = fiber_;
-        coroutine_->Resume();
-        if (coroutine_->IsCompleted()) {
-            delete fiber_;
-        }
-        else {
-            (*awaiter_)->AwaitSuspend();
-        }
-    }
-
+    //// FIBER_HANDLE
     void FiberHandle::Schedule() {
         fiber_->Schedule();
     }
@@ -66,10 +57,6 @@ namespace Fibers {
 
     void FiberHandle::Suspend(Awaiters::IAwaiter* awaiter) {
         fiber_->Suspend(awaiter);
-    }
-
-    void FiberHandle::Resume() {
-        fiber_->Resume();
     }
 
     Executors::IExecutor &FiberHandle::GetScheduler() {

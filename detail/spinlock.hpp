@@ -9,69 +9,72 @@ namespace Detail {
     *
     *  QueueSpinLock qspinlock;
     *  {
-    *    QueueSpinLock::UniqueLock lock(qspinlock);  // <-- Acquire
+    *    QueueSpinLock::Guard lock(qspinlock);  // <-- Acquire
     *    // Critical section
     *  }  // <-- Release
     */
 
     class QueueSpinLock {
     public:
-        class UniqueLock {
+        class Guard {
         public:
             friend QueueSpinLock;
-            explicit UniqueLock(QueueSpinLock& spinlock) : spinlock_(spinlock) {
+            explicit Guard(QueueSpinLock& spinlock) : spinlock_(spinlock) {
                 spinlock.Acquire(this);
             }
 
-            void Lock() {
-                locked_ = true;
-                spinlock_.Acquire(this);
-            }
-
-            void Unlock() {
-                locked_ = false;
-                spinlock_.Release(this);
-            }
-
-            ~UniqueLock() noexcept {
-                if (locked_) {
+            ~Guard() noexcept {
+                if (!released_) {
                     spinlock_.Release(this);
                 }
             }
 
+            // twice unlock - UB
+            void Unlock() {
+                spinlock_.Release(this);
+                released_ = true;
+            }
+
         private:
             QueueSpinLock& spinlock_;
-            bool locked_ = true;
-            std::atomic<UniqueLock*> next_ = nullptr;
+            std::atomic<Guard*> next_{ nullptr };
             std::atomic_flag owner_{ false };
+            bool released_ = false;
         };
 
     private:
-        void Acquire(UniqueLock* guard) {
-            UniqueLock* old_tail = tail_.load(std::memory_order_relaxed);
-            while (!tail_.compare_exchange_weak(old_tail, guard,
+        void Acquire(Guard* guard) {
+            Guard* old_tail_ = tail_.load(std::memory_order_relaxed);
+            while (!tail_.compare_exchange_weak(old_tail_, guard,
                                                 std::memory_order_acquire,
                                                 std::memory_order_relaxed)) {
             }
-            if (old_tail != nullptr) {
-                old_tail->next_.store(guard, std::memory_order_release);
-                while (!guard->owner_.test(std::memory_order_acquire)) {
-                    SpinLockPause();
-                }
+
+            if (old_tail_ == nullptr) {
+                return;
+            }
+
+            old_tail_->next_.store(guard, std::memory_order_release);
+
+            while (!guard->owner_.test(std::memory_order_acquire)) {
+                SpinLockPause();
             }
         }
 
-        void Release(UniqueLock* owner) {
-            UniqueLock* owner_copy = owner;
-            if (!tail_.compare_exchange_strong(owner_copy, nullptr,
-                                               std::memory_order_release,
-                                               std::memory_order_relaxed)) {
-                UniqueLock* next;
-                while ((next = owner->next_.load(std::memory_order_acquire)) == nullptr) {
-                    SpinLockPause();
-                }
-                next->owner_.test_and_set(std::memory_order_release);
+        void Release(Guard* owner) {
+            Guard* owner_copy = owner;
+            if (tail_.compare_exchange_strong(owner_copy, nullptr,
+                                              std::memory_order_release,
+                                              std::memory_order_relaxed)) {
+                return;
             }
+
+            Guard* next;
+            while ((next = owner->next_.load(std::memory_order_acquire)) == nullptr) {
+                SpinLockPause();
+            }
+
+            next->owner_.test_and_set(std::memory_order_release);
         }
 
         static void SpinLockPause() {
@@ -79,7 +82,7 @@ namespace Detail {
         }
 
     private:
-        std::atomic<UniqueLock*> tail_{ nullptr };
+        std::atomic<Guard*> tail_{ nullptr };
     };
 
 }

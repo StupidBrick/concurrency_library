@@ -12,6 +12,48 @@ namespace Fibers {
     using Coroutines::Stackful::Coroutine;
     using Executors::Routine;
 
+    class Fiber;
+
+    template <typename Functor>
+    class FiberTask : public Intrusive::TaskBase {
+    public:
+        friend Fiber;
+
+        FiberTask(Functor func, Fiber* fiber) : func_(std::move(func)), owning_fiber_(fiber) {
+        }
+
+        bool AllocatedOnHeap() override {
+            return true;
+        }
+
+        void Run() override {
+            func_();
+        }
+
+        void Discard() override;
+
+    private:
+        Functor func_;
+        Fiber* owning_fiber_;
+        bool need_to_delete_after_discard_ = true;
+    };
+
+
+    class FiberFunctor {
+    public:
+        FiberFunctor(Coroutine* coroutine, Awaiters::IAwaiter** awaiter,
+                Fiber* fiber) : coroutine_(coroutine), awaiter_(awaiter), fiber_(fiber) {
+        }
+
+        void operator()();
+
+    private:
+        Coroutine* coroutine_;
+        Awaiters::IAwaiter** awaiter_;
+        Fiber* fiber_;
+    };
+
+
     class Fiber {
     public:
         explicit Fiber(std::function<void()> routine, Executors::IExecutor& executor);
@@ -22,8 +64,6 @@ namespace Fibers {
 
         void Suspend(Awaiters::IAwaiter* awaiter);
 
-        void Resume();
-
         Executors::IExecutor& GetScheduler();
 
         static FiberHandle Self();
@@ -32,21 +72,18 @@ namespace Fibers {
         Coroutine coroutine_;
         Awaiters::IAwaiter* awaiter_ = nullptr;
 
-        struct Functor_ {
-            Functor_(Coroutine* coroutine, Awaiters::IAwaiter** awaiter,
-                     Fiber* fiber) : coroutine_(coroutine), awaiter_(awaiter), fiber_(fiber) {
-            }
-
-            void operator()();
-
-        private:
-            Coroutine* coroutine_;
-            Awaiters::IAwaiter** awaiter_;
-            Fiber* fiber_;
-        };
-
         // to avoid extra memory allocations
-        Intrusive::DefaultTask<Functor_> step_{ Functor_(&coroutine_, &awaiter_, this), /*is_allocated_on_heap=*/false };
+        FiberTask<FiberFunctor> step_{ FiberFunctor(&coroutine_, &awaiter_, this), this };
         Executors::IExecutor* executor_ = nullptr;
     };
+
+    template <typename Functor>
+    void FiberTask<Functor>::Discard() {
+        if (need_to_delete_after_discard_) {
+            delete owning_fiber_;
+        }
+        else {
+            need_to_delete_after_discard_ = true;
+        }
+    }
 }

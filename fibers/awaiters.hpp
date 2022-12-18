@@ -4,6 +4,11 @@
 #include "../intrusive/tasks/default_task.hpp"
 #include "iawaiter.hpp"
 #include "../futures/future.hpp"
+#include "../detail/spinlock.hpp"
+#include "../intrusive/structures/singly_directed_list_node.hpp"
+#include "../intrusive/structures/bidirectional_list_node.hpp"
+#include "../intrusive/structures/list.hpp"
+#include <optional>
 
 namespace Fibers::Awaiters {
 
@@ -58,6 +63,111 @@ namespace Fibers::Awaiters {
         FiberHandle handle_;
         Futures::Future<T> future_;
         Futures::Result<ResultType>& result_;
+    };
+
+    template <typename T>
+    class ChannelProducerAwaiter : public IAwaiter, public Intrusive::SinglyDirectedListNode {
+    public:
+        ChannelProducerAwaiter(FiberHandle handle, T&& result,
+                               ::Detail::QueueSpinLock::Guard& guard) :
+                               handle_(handle), result_(std::forward<T>(result)), guard_(guard) {
+        }
+
+        void AwaitSuspend() override {
+            guard_.Unlock();
+        }
+
+        T Resume() {
+            handle_.Schedule();
+            return std::move(result_);
+        }
+
+    private:
+        ::Detail::QueueSpinLock::Guard& guard_;
+        FiberHandle handle_;
+        T result_;
+    };
+
+    class ChannelConsumerAwaiterBase : public IAwaiter, public Intrusive::BidirectionalListNode {
+    public:
+        virtual void SetQueue(Intrusive::List* queue) {
+        }
+
+        virtual void SetIndex(int index) {
+        }
+    };
+
+    template <typename T>
+    class IChannelConsumerAwaiter : public ChannelConsumerAwaiterBase {
+    public:
+        virtual void Resume(T&&) = 0;
+    };
+
+    template <typename T>
+    class ChannelConsumerAwaiter : public IChannelConsumerAwaiter<T> {
+    public:
+        ChannelConsumerAwaiter(FiberHandle fiber, std::optional<T>& result,
+                               ::Detail::QueueSpinLock::Guard& guard) : fiber_(fiber), result_(result), guard_(guard) {
+        }
+
+        void AwaitSuspend() override {
+            guard_.Unlock();
+        }
+
+        void Resume(T&& result) override {
+            result_ = std::forward<T>(result);
+            fiber_.Schedule();
+        }
+
+    private:
+        FiberHandle fiber_;
+        std::optional<T>& result_;
+        ::Detail::QueueSpinLock::Guard& guard_;
+    };
+
+    template <typename T, typename Variant, size_t Size>
+    class SelectorAwaiter : public IChannelConsumerAwaiter<T> {
+    private:
+        using AwaitersArray = std::array<std::pair<Intrusive::BidirectionalListNode*, Intrusive::List*>, Size>;
+
+    public:
+        SelectorAwaiter(FiberHandle fiber, Variant& result, AwaitersArray& awaiters, std::atomic_flag& is_result_set) :
+        fiber_(fiber), result_(result), awaiters_(awaiters), is_result_set_(is_result_set) {
+            awaiters_[index_] = { this, nullptr };
+        }
+
+        void AwaitSuspend() override {
+            if (is_result_set_.test_and_set(std::memory_order_acquire)) {
+                fiber_.Schedule();
+            }
+        }
+
+        void Resume(T&& result) override {
+            result_ = std::move(result);
+            for (size_t i = 0; i < Size; ++i) {
+                if (i != index_ && awaiters_[i].second != nullptr) {
+                    awaiters_[i].second->Unlink(awaiters_[i].first);
+                }
+            }
+            if (is_result_set_.test_and_set(std::memory_order_release)) {
+                fiber_.Schedule();
+            }
+        }
+
+        void SetQueue(Intrusive::List* list) override {
+            awaiters_[index_] = { awaiters_[index_].first, list };
+        }
+
+        void SetIndex(int index) override {
+            index_ = index;
+        }
+
+    private:
+        FiberHandle fiber_;
+        Variant& result_;
+        AwaitersArray& awaiters_;
+        size_t index_ = 0;
+        std::atomic_flag& is_result_set_;
     };
 
 }
