@@ -11,7 +11,7 @@ namespace Detail {
         }
 
         void Done() {
-            if (count_.fetch_sub(1, std::memory_order_relaxed) == 1) {
+            if (count_.fetch_sub(1, std::memory_order_release) == 1) {
                 count_.notify_all();
             }
         }

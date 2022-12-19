@@ -46,7 +46,7 @@ namespace Detail {
         void Acquire(Guard* guard) {
             Guard* old_tail_ = tail_.load(std::memory_order_relaxed);
             while (!tail_.compare_exchange_weak(old_tail_, guard,
-                                                std::memory_order_acquire,
+                                                std::memory_order_acq_rel, // acquire
                                                 std::memory_order_relaxed)) {
             }
 
@@ -64,7 +64,7 @@ namespace Detail {
         void Release(Guard* owner) {
             Guard* owner_copy = owner;
             if (tail_.compare_exchange_strong(owner_copy, nullptr,
-                                              std::memory_order_release,
+                                              std::memory_order_release, // release
                                               std::memory_order_relaxed)) {
                 return;
             }

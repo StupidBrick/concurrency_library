@@ -43,6 +43,46 @@ namespace Fibers::Awaiters {
         FiberHandle handle_;
     };
 
+    class MutexAwaiter : public IAwaiter, public Intrusive::SinglyDirectedListNode {
+    public:
+        MutexAwaiter(FiberHandle handle, Detail::QueueSpinLock::Guard& guard) : handle_(handle), guard_(guard) {
+        }
+
+        void AwaitSuspend() override {
+            guard_.Unlock();
+        }
+
+        void Resume() {
+            handle_.Schedule();
+        }
+
+    private:
+        FiberHandle handle_;
+        Detail::QueueSpinLock::Guard& guard_;
+    };
+
+    class WaitGroupAwaiter : public IAwaiter, public Intrusive::SinglyDirectedListNode {
+    public:
+        WaitGroupAwaiter(FiberHandle handle, std::atomic_flag& resumed) : handle_(handle), resumed_(resumed) {
+        }
+
+        void AwaitSuspend() override {
+            if (resumed_.test_and_set(std::memory_order_acq_rel)) {
+                handle_.Schedule();
+            }
+        }
+
+        void Resume() {
+            if (resumed_.test_and_set(std::memory_order_acq_rel)) {
+                handle_.Schedule();
+            }
+        }
+
+    private:
+        FiberHandle handle_;
+        std::atomic_flag& resumed_;
+    };
+
     template <typename T, typename ResultType>
     class FutureAwaiter : public IAwaiter {
     public:
