@@ -61,4 +61,4 @@ add_executable(ConcurrencyLibrary ${PROJECT_SOURCES} ${PROJECT_HEADERS})
 
 TARGET_LINK_LIBRARIES(ConcurrencyLibrary LINK_PUBLIC ${Boost_LIBRARIES})
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O0")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O2 -fsanitize=leak")

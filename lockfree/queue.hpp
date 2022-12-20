@@ -3,14 +3,28 @@
 #include <atomic>
 #include <optional>
 #include <memory>
+#include <map>
+#include <vector>
 
 
 namespace LockFree {
 
     // Michael-Scott Queue
+
+    // memory control idea :
+    // we have 3 counters : external (CountedPtr<Node>.GetCount()), internal (first 32 bits of Node.internal_count)
+    // and count of external counters (others bits of Node.internal_count)
+    // external counts number of this atomic counted ptr viewers
+    // internal counts number of all stopping views
+    // count of external counters <= 2 ((previous node next or head_) and tail_)
+    // when internal + all externals == 0 we can delete node
     template <typename T>
     class Queue {
     private:
+        // pointer + counter
+        // first 16 bit - counter
+        // last 48 bits - pointer
+        // structure takes 64 bits to fit in 1 machine word
         template <typename U>
         struct CountedPtr {
         private:
@@ -62,6 +76,7 @@ namespace LockFree {
 
         };
 
+        // internal_count == -count of all stopping views + count of external counters * kOneCounter
         struct Node {
             static const long long kOneCounter = ((uint64_t)1 << 60);
 
@@ -88,11 +103,11 @@ namespace LockFree {
         ~Queue() noexcept;
 
     private:
-        static void IncreaseExternalCount(std::atomic<CountedPtr<Node>>& atomic_ptr, CountedPtr<Node>& old_atomic);
+        void IncreaseExternalCount(std::atomic<CountedPtr<Node>>& atomic_ptr, CountedPtr<Node>& old_atomic);
 
-        static void ReleaseRef(Node* node);
+        void ReleaseRef(Node* node);
 
-        static void ReleaseOneCounter(CountedPtr<Node>& ptr, int inc = 0);
+        void ReleaseOneCounter(CountedPtr<Node>& ptr, long long inc = 0);
 
     private:
         std::atomic<CountedPtr<Node>> head_;
@@ -101,9 +116,23 @@ namespace LockFree {
 
     template <typename T>
     Queue<T>::Queue() {
-        CountedPtr<Node> head(new Node, 1);
-        head_.store(head, std::memory_order_relaxed);
-        tail_.store(head, std::memory_order_relaxed);
+        Node* head = new Node(nullptr);
+        head_.store(CountedPtr<Node>(head, 1), std::memory_order_relaxed);
+        tail_.store(CountedPtr<Node>(head, 1), std::memory_order_relaxed);
+    }
+
+    template <typename T>
+    Queue<T>::~Queue() noexcept {
+        CountedPtr<Node> head = head_.load(std::memory_order_relaxed);
+        CountedPtr<Node> next = head->next.load(std::memory_order_relaxed);
+        delete head.GetPointer();
+        head = next;
+        while (head.GetPointer() != nullptr) {
+            delete head->value;
+            next = head->next.load(std::memory_order_relaxed);
+            delete head.GetPointer();
+            head = next;
+        }
     }
 
     template <typename T>
@@ -118,75 +147,72 @@ namespace LockFree {
         CountedPtr<Node> new_tail(new Node(ptr.get()), 1);
         ptr.release();
 
-        CountedPtr<Node> old_tail = tail_.load(std::memory_order_relaxed);
+        CountedPtr<Node> old_tail = tail_.load();
         while (true) {
             IncreaseExternalCount(tail_, old_tail);
-            CountedPtr<Node> old_tail_ptr;
 
-            if (old_tail->next.compare_exchange_strong(old_tail_ptr, new_tail)) { // TODO memory order
-                if (tail_.compare_exchange_strong(old_tail, new_tail)) { // TODO memory order
+            CountedPtr<Node> old_tail_copy = old_tail;
+
+            CountedPtr<Node> old_tail_next; // nullptr
+            if (old_tail->next.compare_exchange_strong(old_tail_next, new_tail)) {
+                if (tail_.compare_exchange_strong(old_tail_copy, new_tail)) {
                     ReleaseOneCounter(old_tail);
+                }
+                else {
+                    ReleaseRef(old_tail.GetPointer());
                 }
                 return;
             }
-
-            Node* node_ptr = old_tail.GetPointer();
-            if (tail_.compare_exchange_strong(old_tail, old_tail->next.load())) { // TODO memory order
-                ReleaseOneCounter(old_tail);
-            }
             else {
-                ReleaseRef(node_ptr);
+                // helps to another thread
+                CountedPtr<Node> next_tail = old_tail->next.load();
+                if (next_tail.GetPointer() != nullptr  && tail_.compare_exchange_strong(old_tail_copy, next_tail)) {
+                    ReleaseOneCounter(old_tail);
+                }
+                else {
+                    ReleaseRef(old_tail.GetPointer());
+                }
             }
         }
     }
 
     template <typename T>
     std::optional<T> Queue<T>::TryPop() {
-        CountedPtr<Node> old_head = head_.load(std::memory_order_relaxed);
-        CountedPtr<Node> next_head = head_.load(std::memory_order_relaxed);
+        CountedPtr<Node> head = head_.load();
         while (true) {
-            IncreaseExternalCount(head_, old_head);
-            IncreaseExternalCount(old_head->next, next_head);
-            Node* old_head_ptr = old_head.GetPointer();
+            IncreaseExternalCount(head_, head);
+            CountedPtr<Node> tail = tail_.load();
+            CountedPtr<Node> next_head = head->next.load();
 
-            CountedPtr<Node> tail = tail_.load(); // TODO memory order
-
-            if (old_head_ptr == tail.GetPointer()) {
+            if (head.GetPointer() == tail.GetPointer()) {
                 if (next_head.GetPointer() == nullptr) {
+                    ReleaseRef(head.GetPointer());
                     return std::nullopt;
                 }
-
-                if (tail_.compare_exchange_strong(tail, next_head)) { // TODO memory order
-                    ReleaseOneCounter(tail, 1); // 1 : because we didn't capture tail
+                // helps to another thread
+                if (tail_.compare_exchange_strong(tail, next_head))  {
+                    ReleaseOneCounter(tail, 1); // +1 because we didn't increase the external counter
                 }
             }
-            else if (head_.compare_exchange_strong(old_head, next_head)) { // TODO memory order
-                T* result_ptr = std::move(next_head->value);
-                ReleaseOneCounter(old_head);
-                ReleaseRef(next_head.GetPointer());
+            else {
+                next_head.IncreaseCount(); // increase external counter
 
-                T result = std::move(*result_ptr);
-                delete result_ptr;
-
-                return { std::move(result) };
+                CountedPtr<Node> head_copy = head;
+                if (head_.compare_exchange_strong(head_copy, next_head)) {
+                    T result = std::move(*next_head->value);
+                    delete next_head->value;
+                    ReleaseOneCounter(head);
+                    ReleaseRef(next_head.GetPointer());
+                    return std::move(result);
+                }
             }
 
-            ReleaseRef(old_head_ptr);
-            ReleaseRef(next_head.GetPointer());
+            ReleaseRef(head.GetPointer());
         }
     }
 
     template <typename T>
-    void Queue<T>::ReleaseOneCounter(CountedPtr <Node> &ptr, int inc) {
-        long long increase = (long long)ptr.GetCount() - 2 - Node::kOneCounter + inc;
-
-        if (ptr->internal_count.fetch_add(increase) == -increase) {
-            delete ptr.GetPointer();
-        }
-    }
-
-    template <typename T>
-    void Queue<T>::IncreaseExternalCount(std::atomic<CountedPtr<Node>> &atomic_ptr, CountedPtr <Node> &old_atomic) {
+    void Queue<T>::IncreaseExternalCount(std::atomic<CountedPtr<Node>> &atomic_ptr, CountedPtr<Node> &old_atomic) {
         CountedPtr<Node> new_atomic;
         do {
             new_atomic = old_atomic;
@@ -203,15 +229,11 @@ namespace LockFree {
     }
 
     template <typename T>
-    Queue<T>::~Queue() noexcept{
-        CountedPtr<Node> head = head_.load(std::memory_order_relaxed);
-
-        while (head.GetPointer() != nullptr) {
-            CountedPtr<Node> new_head = head->next.load(std::memory_order_relaxed);
-            delete head.GetPointer();
-            head = new_head;
+    void Queue<T>::ReleaseOneCounter(CountedPtr<Node> &ptr, long long inc) {
+        long long increase = (long long)ptr.GetCount() - 2 - Node::kOneCounter + inc;
+        if (ptr->internal_count.fetch_add(increase) == -increase) {
+            delete ptr.GetPointer();
         }
     }
-
 
 }
